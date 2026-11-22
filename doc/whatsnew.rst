@@ -6,6 +6,12 @@ What's New in dnspython
 2.10.0 (in development)
 -----------------------
 
+* The stub resolver now tracks nameserver failures across resolutions.
+  A nameserver with three or more consecutive failures is deprioritized
+  in favor of nameservers that are not failing, and becomes eligible for
+  probing again after a backoff period, so a recovered nameserver is
+  discovered automatically.
+
 * ``dns.name.from_text()`` is faster.  A name without escapes is now split at
   its dots, instead of being read one byte at a time, so e.g.
   ``www.example.com.`` takes about half the time it did.  Names with escapes

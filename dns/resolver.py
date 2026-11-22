@@ -634,6 +634,38 @@ class LRUCache(CacheBase):
                 self.data = {}
 
 
+class _NameserverHealth:
+    """Health state for a single nameserver, shared by all resolutions
+    made with a resolver.
+
+    The state is deliberately updated without any locks.  The updates
+    are simple enough that they are effectively atomic in practice, and
+    an occasional lost update under thread contention is harmless as the
+    values are only heuristics used to deprioritize failing nameservers.
+    """
+
+    __slots__ = ("failures", "last_failure")
+
+    def __init__(self) -> None:
+        # The number of consecutive failures.
+        self.failures = 0
+        # The time.monotonic() of the most recent failure.
+        self.last_failure = 0.0
+
+
+# The number of consecutive failures after which a nameserver is
+# considered to be down and is deprioritized.
+_NAMESERVER_FAILURE_THRESHOLD = 3
+
+# A nameserver that is down becomes eligible for probing again after a
+# backoff that starts at _NAMESERVER_MIN_BACKOFF seconds and doubles with
+# each additional consecutive failure, up to _NAMESERVER_MAX_BACKOFF
+# seconds.  This lets a recovered nameserver be discovered automatically
+# without needing a dedicated probing thread.
+_NAMESERVER_MIN_BACKOFF = 1.0
+_NAMESERVER_MAX_BACKOFF = 30.0
+
+
 class _Resolution:
     """Helper class for dns.resolver.Resolver.resolve().
 
@@ -741,6 +773,15 @@ class _Resolution:
             )
             if self.resolver.rotate:
                 random.shuffle(self.nameservers)
+            # Try nameservers that have not been failing recently first,
+            # but keep the failing ones as fallbacks in case all
+            # nameservers are down.  The sort is stable, so any shuffling
+            # done for "rotate" is preserved within each group.
+            self.nameservers.sort(
+                key=lambda nameserver: not self.resolver._nameserver_available(
+                    nameserver
+                )
+            )
             self.current_nameservers = self.nameservers[:]
             self.errors = []
             self.nameserver = None
@@ -771,7 +812,15 @@ class _Resolution:
             if len(self.nameservers) == 0:
                 # Out of things to try!
                 raise NoNameservers(request=self.request, errors=self.errors)
-            self.current_nameservers = self.nameservers[:]
+            available = [
+                nameserver
+                for nameserver in self.nameservers
+                if self.resolver._nameserver_available(nameserver)
+            ]
+            # If all nameservers are unavailable, try them all anyway; we
+            # have to query someone, and this also lets recovering
+            # nameservers prove themselves.
+            self.current_nameservers = available or self.nameservers[:]
             backoff = self.backoff
             self.backoff = min(self.backoff * 2, 2)
 
@@ -798,24 +847,34 @@ class _Resolution:
                     response,
                 )
             )
-            if (
-                isinstance(ex, dns.exception.FormError)
-                or isinstance(ex, EOFError)
-                or isinstance(ex, OSError)
-                or isinstance(ex, NotImplementedError)
-            ):
-                # This nameserver is no good, take it out of the mix.
-                self.nameservers.remove(self.nameserver)
-            elif isinstance(ex, dns.message.Truncated):
+            if isinstance(ex, dns.message.Truncated):
+                # Truncation is not a failure; it's a signal to retry
+                # with TCP.
                 if self.tcp_attempt:
                     # Truncation with TCP is no good!
                     self.nameservers.remove(self.nameserver)
                 else:
                     self.retry_with_tcp = True
+            else:
+                # Record the failure in the resolver's shared nameserver
+                # health state, so that other resolutions can avoid this
+                # nameserver if it keeps failing.
+                self.resolver._note_nameserver_failure(self.nameserver)
+                if (
+                    isinstance(ex, dns.exception.FormError)
+                    or isinstance(ex, EOFError)
+                    or isinstance(ex, OSError)
+                    or isinstance(ex, NotImplementedError)
+                ):
+                    # This nameserver is no good, take it out of the mix.
+                    self.nameservers.remove(self.nameserver)
             return (None, False)
         # We got an answer!
         assert response is not None
         assert isinstance(response, dns.message.QueryMessage)
+        # The nameserver responded, so it is healthy as far as we're
+        # concerned, even if we don't like the answer.
+        self.resolver._note_nameserver_success(self.nameserver)
         rcode = response.rcode()
         if rcode == dns.rcode.NOERROR:
             try:
@@ -931,6 +990,7 @@ class BaseResolver:
     rotate: bool
     ndots: int | None
     _nameservers: Sequence[str | dns.nameserver.Nameserver]
+    _nameserver_health: dict[str, _NameserverHealth]
 
     def __init__(
         self,
@@ -982,6 +1042,45 @@ class BaseResolver:
         self.retry_servfail = False
         self.rotate = False
         self.ndots = None
+        self._nameserver_health = {}
+
+    def _nameserver_available(self, nameserver: dns.nameserver.Nameserver) -> bool:
+        """Determine if a nameserver should be tried in preference to other
+        nameservers.
+
+        Nameservers with fewer than ``_NAMESERVER_FAILURE_THRESHOLD``
+        consecutive failures are always available.  A nameserver that is
+        down becomes available again after a backoff period, so that a
+        recovered nameserver is discovered automatically by regular
+        queries.
+        """
+
+        health = self._nameserver_health.get(str(nameserver))
+        if health is None or health.failures < _NAMESERVER_FAILURE_THRESHOLD:
+            return True
+        exponent = min(health.failures - _NAMESERVER_FAILURE_THRESHOLD, 16)
+        backoff = min(_NAMESERVER_MIN_BACKOFF * 2**exponent, _NAMESERVER_MAX_BACKOFF)
+        return time.monotonic() - health.last_failure >= backoff
+
+    def _note_nameserver_failure(self, nameserver: dns.nameserver.Nameserver) -> None:
+        """Note that a query to *nameserver* failed, updating the shared
+        nameserver health state."""
+
+        key = str(nameserver)
+        health = self._nameserver_health.get(key)
+        if health is None:
+            health = _NameserverHealth()
+            self._nameserver_health[key] = health
+        health.failures += 1
+        health.last_failure = time.monotonic()
+
+    def _note_nameserver_success(self, nameserver: dns.nameserver.Nameserver) -> None:
+        """Note that a query to *nameserver* got a response, updating the
+        shared nameserver health state."""
+
+        health = self._nameserver_health.get(str(nameserver))
+        if health is not None:
+            health.failures = 0
 
     def read_resolv_conf(self, f: str | os.PathLike | TextIO) -> None:
         """Process *f* as a file in the /etc/resolv.conf format.  If *f* is

@@ -16,6 +16,7 @@
 # OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 import asyncio
+import concurrent.futures
 import pathlib
 import selectors
 import socket
@@ -1348,3 +1349,96 @@ def testAsyncHelpfulNXDOMAIN():
 
         dns.asyncbackend.set_default_backend("asyncio")
         assert asyncio.run(run()) == dns.name.from_text("example.")
+
+
+class CountingNanoNameserver(Server):
+    """Answers A queries for anything, and counts the requests it gets."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.count = 0
+
+    def handle(self, request):
+        self.count += 1
+        response = dns.message.make_response(request.message)
+        response.flags |= dns.flags.RA
+        rrs = dns.rrset.from_text(request.qname, 300, "IN", "A", "10.0.0.1")
+        response.answer.append(rrs)
+        return response
+
+
+class CountingDroppingNanoNameserver(Server):
+    """Drops everything, and counts the requests it gets."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.count = 0
+
+    def handle(self, request):
+        self.count += 1
+        return None
+
+
+def _do53(server):
+    return dns.nameserver.Do53Nameserver("127.0.0.1", server.udp_address[1])
+
+
+@pytest.mark.skipif(not _nanonameserver_available, reason="nanonameserver required")
+def testResolverNameserverFailureTracking():
+    with CountingDroppingNanoNameserver() as bad, CountingNanoNameserver() as good:
+        bad_ns = _do53(bad)
+        res = dns.resolver.Resolver(configure=False)
+        # The bad nameserver is first, so initially each resolution
+        # records a failure for it before failing over to the good one.
+        res.nameservers = [bad_ns, _do53(good)]
+        res.timeout = 0.2
+        res.lifetime = 4.0
+        for _ in range(dns.resolver._NAMESERVER_FAILURE_THRESHOLD):
+            res.resolve("www.example.", "A")
+        # The failures accumulated across resolutions, and the dead
+        # nameserver is now considered down.
+        assert not res._nameserver_available(bad_ns)
+        # Further resolutions skip it entirely.
+        count = bad.count
+        for _ in range(5):
+            res.resolve("www.example.", "A")
+        assert bad.count == count
+        # After the backoff expires, the nameserver becomes eligible
+        # again and is probed by a regular query.
+        time.sleep(dns.resolver._NAMESERVER_MIN_BACKOFF + 0.2)
+        res.resolve("www.example.", "A")
+        assert bad.count == count + 1
+        # The probe failed, so it's down again.
+        assert not res._nameserver_available(bad_ns)
+
+
+@pytest.mark.skipif(not _nanonameserver_available, reason="nanonameserver required")
+def testResolverConcurrentNameserverFailureTracking():
+    with (
+        CountingNanoNameserver() as good1,
+        CountingNanoNameserver() as good2,
+        CountingDroppingNanoNameserver() as bad,
+    ):
+        bad_ns = _do53(bad)
+        res = dns.resolver.Resolver(configure=False)
+        res.nameservers = [_do53(good1), _do53(good2), bad_ns]
+        res.rotate = True
+        res.timeout = 0.2
+        res.lifetime = 4.0
+
+        def resolve(_):
+            return res.resolve("www.example.", "A")
+
+        # Fifty concurrent queries, each retrying and rotating on its
+        # own; all of them succeed thanks to the good nameservers.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+            answers = list(executor.map(resolve, range(50)))
+        assert len(answers) == 50
+        # The failures of the dead nameserver accumulated across the
+        # concurrent queries, taking it out of the rotation.
+        assert not res._nameserver_available(bad_ns)
+        # Another concurrent burst doesn't send it any more queries.
+        count = bad.count
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            list(executor.map(resolve, range(20)))
+        assert bad.count == count
