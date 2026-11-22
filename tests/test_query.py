@@ -17,6 +17,7 @@
 
 import contextlib
 import socket
+import struct
 import sys
 import time
 import unittest
@@ -45,7 +46,7 @@ import tests.util
 # and threading, so try to import it and if it doesn't work, skip
 # those tests.
 try:
-    from .nanonameserver import Server
+    from .nanonameserver import Server, read_exactly
 
     _nanonameserver_available = True
 except ImportError:
@@ -623,6 +624,84 @@ class TsigTests(unittest.TestCase):
             self.assertTrue(rrs is not None)
             seen = set([rdata.address for rdata in rrs])
             self.assertTrue("1.2.3.4" in seen)
+
+
+class ConnectionCountingServer(Server):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.connections = 0
+
+    async def serve_tcp(self, connection_type, stream):
+        self.connections += 1
+        await super().serve_tcp(connection_type, stream)
+
+
+class ClosingConnectionServer(ConnectionCountingServer):
+    """A server that answers a single request per TCP connection and
+    then closes the connection."""
+
+    async def serve_tcp(self, connection_type, stream):
+        self.connections += 1
+        peer = stream.socket.getpeername()
+        local = stream.socket.getsockname()
+        ldata = await read_exactly(stream, 2)
+        (length,) = struct.unpack("!H", ldata)
+        wire = await read_exactly(stream, length)
+        for response_wire in self.handle_wire(wire, peer, local, connection_type):
+            stream_message = struct.pack("!H", len(response_wire)) + response_wire
+            await stream.send_all(stream_message)
+        # Returning closes the connection.
+
+
+@unittest.skipIf(not _nanonameserver_available, "nanonameserver required")
+class TCPConnectionPoolTests(unittest.TestCase):
+    def test_reuses_connections(self):
+        with ConnectionCountingServer() as ns:
+            where, port = ns.tcp_address
+            with dns.query.TCPConnectionPool() as pool:
+                for _ in range(20):
+                    q = dns.message.make_query("example.", "A")
+                    r = dns.query.tcp(q, where, port=port, timeout=5, pool=pool)
+                    self.assertEqual(r.rcode(), dns.rcode.REFUSED)
+            self.assertEqual(ns.connections, 1)
+
+    def test_does_not_reuse_closed_connections(self):
+        # The server closes every connection after one response, so each
+        # query needs a new connection, but all queries must still
+        # succeed; the pool must never write to a closed connection.
+        with ClosingConnectionServer() as ns:
+            where, port = ns.tcp_address
+            with dns.query.TCPConnectionPool() as pool:
+                for _ in range(20):
+                    q = dns.message.make_query("example.", "A")
+                    r = dns.query.tcp(q, where, port=port, timeout=5, pool=pool)
+                    self.assertEqual(r.rcode(), dns.rcode.REFUSED)
+            self.assertEqual(ns.connections, 20)
+
+    def test_close(self):
+        with ConnectionCountingServer() as ns:
+            where, port = ns.tcp_address
+            pool = dns.query.TCPConnectionPool()
+            q = dns.message.make_query("example.", "A")
+            dns.query.tcp(q, where, port=port, timeout=5, pool=pool)
+            pool.close()
+            # The pool is closed, so it cannot be used any more.
+            with self.assertRaises(ValueError):
+                dns.query.tcp(q, where, port=port, timeout=5, pool=pool)
+            # A socket released after the pool is closed is closed
+            # instead of being pooled.
+            pool = dns.query.TCPConnectionPool()
+            sock, _ = pool.get(where, port)
+            pool.close()
+            pool.release(sock)
+            self.assertEqual(sock.fileno(), -1)
+
+    def test_sock_and_pool_are_mutually_exclusive(self):
+        with dns.query.TCPConnectionPool() as pool:
+            q = dns.message.make_query("example.", "A")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                with self.assertRaises(ValueError):
+                    dns.query.tcp(q, "127.0.0.1", sock=sock, pool=pool)
 
 
 @unittest.skipIf(sys.platform == "win32", "low level tests do not work on win32")

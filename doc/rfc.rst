@@ -65,6 +65,9 @@ Core RFCs
 `RFC 6891 <https://tools.ietf.org/html/rfc6891>`_
     EDNS (version 0)
 
+`RFC 7766 <https://tools.ietf.org/html/rfc7766>`_
+    DNS over TCP, including connection reuse.
+
 `RFC 7830 <https://tools.ietf.org/html/rfc7830.html>`_
     The EDNS(0) Padding Option
 

@@ -28,6 +28,9 @@ TCP
 .. autofunction:: dns.query.send_tcp
 .. autofunction:: dns.query.receive_tcp
 
+.. autoclass:: dns.query.TCPConnectionPool
+   :members:
+
 TLS
 ---
 

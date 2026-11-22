@@ -26,6 +26,7 @@ import random
 import selectors
 import socket
 import struct
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -1166,6 +1167,130 @@ def _connect(s, address, expiration):
         raise OSError(err, os.strerror(err))
 
 
+class TCPConnectionPool:
+    """A pool of reusable TCP connections to DNS servers.
+
+    When making many TCP queries, e.g. when resolving a large batch of
+    names, making a new connection for every query is wasteful and can
+    exhaust ephemeral ports, as closed connections linger in the TCP
+    ``TIME_WAIT`` state for some time.  Sharing connections between the
+    queries in a batch, as recommended by RFC 7766, avoids this.
+
+    Connections are pooled per ``(where, port, source, source_port)``
+    tuple.  Idle connections are checked before being reused, and
+    connections that the peer has closed are discarded and replaced, so
+    a closed connection is never kept in the pool or written to.
+
+    The pool is a context manager; exiting the context closes all pooled
+    connections::
+
+        with dns.query.TCPConnectionPool() as pool:
+            for qname in qnames:
+                q = dns.message.make_query(qname, dns.rdatatype.A)
+                r = dns.query.tcp(q, "8.8.8.8", pool=pool)
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._idle: dict[tuple, list[socket.socket]] = {}
+        self._in_use: dict[socket.socket, tuple] = {}
+        self._closed = False
+
+    def _key(self, where, port, source, source_port):
+        return (where, port, source, source_port)
+
+    @staticmethod
+    def _reusable(sock: socket.socket) -> bool:
+        # A pooled socket is only reusable if the peer has not closed it
+        # and no unexpected data is pending.  The socket is nonblocking,
+        # so the peek never waits.
+        try:
+            sock.recv(1, socket.MSG_PEEK)
+            # The peer either closed the connection (b"") or sent
+            # unexpected data; either way we don't want to reuse it.
+            return False
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+
+    def get(
+        self,
+        where: str,
+        port: int = 53,
+        source: str | None = None,
+        source_port: int = 0,
+        expiration: float | None = None,
+    ) -> tuple[socket.socket, bool]:
+        """Get a connected socket for the given destination.
+
+        Returns a ``(socket, reused)`` tuple, where *reused* is ``True``
+        if the socket is a previously used connection from the pool.
+        The caller must eventually pass the socket to ``release()`` if
+        it is still usable, or ``discard()`` if it is not.
+        """
+        key = self._key(where, port, source, source_port)
+        with self._lock:
+            if self._closed:
+                raise ValueError("the pool is closed")
+            idle = self._idle.get(key)
+            while idle:
+                sock = idle.pop()
+                if self._reusable(sock):
+                    self._in_use[sock] = key
+                    return (sock, True)
+                # The peer closed the connection while it was idle.
+                sock.close()
+        # No reusable connection; make a new one.
+        af, destination, source = _destination_and_source(
+            where, port, source, source_port, True
+        )
+        assert af is not None
+        sock = make_socket(af, socket.SOCK_STREAM, source)
+        try:
+            _connect(sock, destination, expiration)
+        except Exception:
+            sock.close()
+            raise
+        with self._lock:
+            self._in_use[sock] = key
+        return (sock, False)
+
+    def release(self, sock: socket.socket) -> None:
+        """Return a socket obtained from ``get()`` to the pool for reuse."""
+        with self._lock:
+            key = self._in_use.pop(sock, None)
+            if key is None or self._closed:
+                sock.close()
+                return
+            self._idle.setdefault(key, []).append(sock)
+
+    def discard(self, sock: socket.socket) -> None:
+        """Remove a socket obtained from ``get()`` from the pool and
+        close it.  This should be used when the connection is known or
+        suspected to be unusable."""
+        with self._lock:
+            self._in_use.pop(sock, None)
+        sock.close()
+
+    def close(self) -> None:
+        """Close all pooled connections.  Connections still in use are
+        closed when they are released."""
+        with self._lock:
+            self._closed = True
+            idle = self._idle
+            self._idle = {}
+        for socks in idle.values():
+            for sock in socks:
+                sock.close()
+
+    def __enter__(self) -> "TCPConnectionPool":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+
 def tcp(
     q: dns.message.Message,
     where: str,
@@ -1176,6 +1301,7 @@ def tcp(
     one_rr_per_rrset: bool = False,
     ignore_trailing: bool = False,
     sock: Any | None = None,
+    pool: TCPConnectionPool | None = None,
 ) -> dns.message.Message:
     """Return the response obtained after sending a query via TCP.
 
@@ -1204,11 +1330,43 @@ def tcp(
         stream socket; *where*, *port*, *source* and *source_port* are
         ignored.
     :type sock: ``socket.socket`` or ``None``
+    :param pool: A pool of reusable TCP connections.  If ``None`` (the
+        default), a new connection is made for this query and closed when
+        the query completes.  If a pool is provided, the connection is
+        returned to the pool when the query completes so that subsequent
+        queries using the pool can reuse it.  *sock* and *pool* are
+        mutually exclusive.
+    :type pool: :py:class:`dns.query.TCPConnectionPool` or ``None``
     :rtype: :py:class:`dns.message.Message`
     """
 
     wire = q.to_wire()
     begin_time, expiration = _compute_times(timeout)
+    if pool is not None:
+        if sock is not None:
+            raise ValueError("sock and pool are mutually exclusive")
+        retry = True
+        while True:
+            s, reused = pool.get(where, port, source, source_port, expiration)
+            try:
+                send_tcp(s, wire, expiration)
+                r, received_time = receive_tcp(
+                    s, expiration, one_rr_per_rrset, q.keyring, q.mac, ignore_trailing
+                )
+            except Exception as e:
+                pool.discard(s)
+                if retry and reused and isinstance(e, (EOFError, OSError)):
+                    # The pooled connection was stale, e.g. the peer closed
+                    # it while it was idle.  Retry once on a fresh
+                    # connection.
+                    retry = False
+                    continue
+                raise
+            pool.release(s)
+            r.time = received_time - begin_time
+            if not q.is_response(r):
+                raise BadResponse
+            return r
     if sock:
         cm: contextlib.AbstractContextManager = contextlib.nullcontext(sock)
     else:
