@@ -18,6 +18,7 @@
 import contextlib
 import socket
 import sys
+import threading
 import time
 import unittest
 
@@ -793,7 +794,71 @@ class IgnoreErrors(unittest.TestCase):
                 bad_r_wire, ("127.0.0.1", 53), self.good_r_wire, ("127.0.0.1", 53)
             ):
                 s = MockSock()
-                dns.query.udp(self.good_r, "127.0.0.1", sock=s)
+                dns.query.udp(
+                    self.good_r,
+                    "127.0.0.1",
+                    sock=s,
+                    allow_late_responses=False,
+                )
+
+        self.assertRaises(dns.query.BadResponse, bad)
+
+    def test_late_response_is_discarded_udp_level(self):
+        # A datagram that does not answer the outstanding query (e.g. the
+        # late response to a previous, timed-out query on a reused socket)
+        # is dropped, and the following valid response is returned.  The
+        # socket stays usable instead of being torn down.
+        bad_r = dns.message.make_response(self.q)
+        bad_r.id = (bad_r.id + 1) % 65536
+        bad_r_wire = bad_r.to_wire()
+        with mock_udp_recv(
+            bad_r_wire, ("127.0.0.1", 53), self.good_r_wire, ("127.0.0.1", 53)
+        ):
+            s = MockSock()
+            r = dns.query.udp(self.good_r, "127.0.0.1", sock=s)
+            self.assertEqual(r, self.good_r)
+
+    def test_late_response_with_colliding_id_is_discarded(self):
+        # The dangerous case for a pooled, reused socket: the late response
+        # to a previous, timed-out query reuses the same 16-bit id as the
+        # new query, but answers a different question.  It must be
+        # recognized via its question section and discarded rather than
+        # accepted on the id match alone.
+        previous_q = dns.message.make_query("previous-example.", "A")
+        late_r = dns.message.make_response(previous_q)
+        # Force the id collision with the query we are about to send.
+        late_r.id = self.good_r.id
+        late_r_wire = late_r.to_wire()
+        with mock_udp_recv(
+            late_r_wire,
+            ("127.0.0.1", 53),
+            self.good_r_wire,
+            ("127.0.0.1", 53),
+        ):
+            s = MockSock()
+            r = dns.query.udp(self.good_r, "127.0.0.1", sock=s)
+            self.assertEqual(r, self.good_r)
+
+    def test_late_response_with_colliding_id_raises_when_disallowed(self):
+        previous_q = dns.message.make_query("previous-example.", "A")
+        late_r = dns.message.make_response(previous_q)
+        late_r.id = self.good_r.id
+        late_r_wire = late_r.to_wire()
+
+        def bad():
+            with mock_udp_recv(
+                late_r_wire,
+                ("127.0.0.1", 53),
+                self.good_r_wire,
+                ("127.0.0.1", 53),
+            ):
+                s = MockSock()
+                dns.query.udp(
+                    self.good_r,
+                    "127.0.0.1",
+                    sock=s,
+                    allow_late_responses=False,
+                )
 
         self.assertRaises(dns.query.BadResponse, bad)
 
@@ -901,3 +966,78 @@ class IgnoreErrors(unittest.TestCase):
             )
 
         self.assertRaises(dns.message.TrailingJunk, bad)
+
+
+class ReusedSocketLateResponseTests(unittest.TestCase):
+    # End-to-end exercise of the "pooled socket" hazard: a query times out,
+    # the socket is returned to the pool and reused, and the response to the
+    # timed-out query only arrives afterwards.  The late datagram must be
+    # recognized and discarded without invalidating the socket.
+
+    def setUp(self):
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.server.bind(("127.0.0.1", 0))
+        self.server.settimeout(5)
+        self.addr = self.server.getsockname()
+
+    def tearDown(self):
+        self.server.close()
+
+    def _run(self, colliding_id):
+        first_q = dns.message.make_query("first.example.", "A")
+        second_q = dns.message.make_query("second.example.", "A")
+        second_answer = dns.message.make_response(second_q)
+        errors = []
+
+        def server_thread():
+            try:
+                # Receive the first query, but answer it only later so the
+                # client times out and returns the socket to the pool.
+                wire, peer = self.server.recvfrom(65535)
+                first_request = dns.message.from_wire(wire)
+                # The client reuses the socket and sends the second query.
+                wire, _ = self.server.recvfrom(65535)
+                second_request = dns.message.from_wire(wire)
+                self.assertEqual(second_request.question, second_q.question)
+                # Now the late response to the timed-out query arrives.
+                late_answer = dns.message.make_response(first_request)
+                if colliding_id:
+                    late_answer.id = second_q.id
+                self.server.sendto(late_answer.to_wire(), peer)
+                # Followed by the genuine response to the second query.
+                self.server.sendto(second_answer.to_wire(), peer)
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        worker = threading.Thread(target=server_thread)
+        worker.start()
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setblocking(False)
+            with self.assertRaises(dns.exception.Timeout):
+                dns.query.udp(
+                    first_q,
+                    self.addr[0],
+                    port=self.addr[1],
+                    sock=sock,
+                    timeout=0.1,
+                )
+            response = dns.query.udp(
+                second_q,
+                self.addr[0],
+                port=self.addr[1],
+                sock=sock,
+                timeout=5,
+            )
+            worker.join()
+            self.assertEqual(errors, [])
+            self.assertEqual(response, second_answer)
+        finally:
+            sock.close()
+
+    def test_late_response_after_timeout_is_ignored(self):
+        self._run(colliding_id=False)
+
+    def test_late_response_with_colliding_id_after_timeout(self):
+        self._run(colliding_id=True)

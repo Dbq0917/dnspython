@@ -786,6 +786,7 @@ def receive_udp(
     raise_on_truncation: bool = False,
     ignore_errors: bool = False,
     query: dns.message.Message | None = None,
+    allow_late_responses: bool = False,
 ) -> Any:
     """Read a DNS message from a UDP socket.
 
@@ -821,6 +822,11 @@ def receive_udp(
     :param query: If not ``None`` and *ignore_errors* is ``True``, verify
         the received message is a response to this query.
     :type query: :py:class:`dns.message.Message` or ``None``
+    :param allow_late_responses: If ``True``, treat any datagram that is not
+        a response to *query* as a late response left over from a previous
+        query on a reused socket, discard it, and keep waiting instead of
+        raising.  *query* must be set when this is ``True``.
+    :type allow_late_responses: bool
     :returns: If *destination* is not ``None``, a
         ``(message, received_time)`` tuple; otherwise a
         ``(message, received_time, from_address)`` tuple.
@@ -850,20 +856,36 @@ def receive_udp(
             # message seems to be a response as we need to know when truncation happens.
             # We need to check that it seems to be a response as we don't want a random
             # injected message with TC set to cause us to bail out.
+            if ignore_errors:
+                if query is not None and not query.is_response(e.message()):
+                    continue
+                raise
             if (
-                ignore_errors
+                allow_late_responses
                 and query is not None
                 and not query.is_response(e.message())
             ):
+                # A late response belonging to an earlier query on a reused
+                # socket; drop it and keep the socket usable.
                 continue
-            else:
-                raise
+            raise
         except Exception:
             if ignore_errors:
+                continue
+            if allow_late_responses:
+                # A late response that failed to parse is still safe to
+                # discard; keep waiting for the real response.
                 continue
             else:
                 raise
         if ignore_errors and query is not None and not query.is_response(r):
+            continue
+        if allow_late_responses and query is not None and not query.is_response(r):
+            # The datagram does not answer the outstanding query.  On a
+            # reused socket this is typically a late response to a previous
+            # query that timed out; discarding it instead of raising keeps
+            # the connection usable and prevents a response whose 16-bit id
+            # merely collided from being accepted as this query's answer.
             continue
         if destination:
             return (r, received_time)
@@ -884,6 +906,7 @@ def udp(
     raise_on_truncation: bool = False,
     sock: Any | None = None,
     ignore_errors: bool = False,
+    allow_late_responses: bool = True,
 ) -> dns.message.Message:
     """Return the response obtained after sending a query via UDP.
 
@@ -920,6 +943,14 @@ def udp(
     :param ignore_errors: If ``True``, ignore format errors or response
         mismatches and keep listening for a valid response.
     :type ignore_errors: bool
+    :param allow_late_responses: If ``True`` (the default), discard datagrams
+        that are not a response to *q* and keep waiting for the real one.
+        This matters when *sock* is reused after a timeout, as the late
+        response to the earlier query may still be buffered; it keeps the
+        socket usable and prevents a response with a colliding 16-bit id
+        from being mistaken for this query's answer.  Set it to ``False``
+        to get the historical behavior of raising ``BadResponse``.
+    :type allow_late_responses: bool
     :rtype: :py:class:`dns.message.Message`
     """
 
@@ -947,11 +978,14 @@ def udp(
             raise_on_truncation,
             ignore_errors,
             q,
+            allow_late_responses,
         )
         r.time = received_time - begin_time
         # We don't need to check q.is_response() if we are in ignore_errors mode
-        # as receive_udp() will have checked it.
-        if not (ignore_errors or q.is_response(r)):
+        # as receive_udp() will have checked it; and when late responses are
+        # allowed, receive_udp() will have discarded any non-matching
+        # datagram, so anything returned must answer this query.
+        if not (ignore_errors or allow_late_responses or q.is_response(r)):
             raise BadResponse
         return r
     assert (
@@ -972,6 +1006,7 @@ def udp_with_fallback(
     udp_sock: Any | None = None,
     tcp_sock: Any | None = None,
     ignore_errors: bool = False,
+    allow_late_responses: bool = True,
 ) -> tuple[dns.message.Message, bool]:
     """Return the response to the query, trying UDP first and falling back
     to TCP if UDP results in a truncated response.
@@ -1011,6 +1046,10 @@ def udp_with_fallback(
     :param ignore_errors: If ``True``, ignore UDP format errors or response
         mismatches and keep listening for a valid response.
     :type ignore_errors: bool
+    :param allow_late_responses: If ``True`` (the default), discard datagrams
+        that are not a response to *q* and keep waiting; see
+        :py:func:`udp()` for details.
+    :type allow_late_responses: bool
     :returns: A ``(message, used_tcp)`` tuple; *used_tcp* is ``True`` if and
         only if TCP was used.
     :rtype: tuple[:py:class:`dns.message.Message`, bool]
@@ -1029,6 +1068,7 @@ def udp_with_fallback(
             True,
             udp_sock,
             ignore_errors,
+            allow_late_responses,
         )
         return (response, False)
     except dns.message.Truncated:

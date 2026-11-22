@@ -6,6 +6,18 @@ What's New in dnspython
 2.10.0 (in development)
 -----------------------
 
+* The UDP query functions ``dns.query.udp()``, ``dns.query.udp_with_fallback()``
+  and their ``dns.asyncquery`` counterparts now discard datagrams that are not
+  a response to the outstanding query and keep waiting, instead of accepting
+  the first datagram whose 16-bit id matches.  This matters when a socket is
+  reused after a timeout, as the late response to the earlier query can still
+  be buffered; previously such a response could be mistaken for the new
+  query's answer whenever the two queries happened to use the same id,
+  poisoning callers and their caches with another name's data.  The socket is
+  kept usable rather than being discarded.  The historical behavior of
+  raising ``dns.query.BadResponse`` is available by passing
+  ``allow_late_responses=False``.
+
 * Add private and public key serialization to and from JWK files and BIND
   private key files via the ``Key`` class methods.
 

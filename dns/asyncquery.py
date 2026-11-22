@@ -131,6 +131,7 @@ async def receive_udp(
     raise_on_truncation: bool = False,
     ignore_errors: bool = False,
     query: dns.message.Message | None = None,
+    allow_late_responses: bool = False,
 ) -> Any:
     """Read a DNS message from a UDP socket.
 
@@ -138,7 +139,7 @@ async def receive_udp(
     :type sock: :py:class:`dns.asyncbackend.DatagramSocket`
 
     See :py:func:`dns.query.receive_udp` for the documentation of the other
-    parameters and exceptions.
+    parameters and exceptions, including *allow_late_responses*.
 
     :returns: A ``(message, received_time, from_address)`` tuple.
     :rtype: tuple
@@ -163,20 +164,31 @@ async def receive_udp(
             )
         except dns.message.Truncated as e:
             # See the comment in query.py for details.
+            if ignore_errors:
+                if query is not None and not query.is_response(e.message()):
+                    continue
+                raise
             if (
-                ignore_errors
+                allow_late_responses
                 and query is not None
                 and not query.is_response(e.message())
             ):
                 continue
-            else:
-                raise
+            raise
         except Exception:
             if ignore_errors:
+                continue
+            if allow_late_responses:
                 continue
             else:
                 raise
         if ignore_errors and query is not None and not query.is_response(r):
+            continue
+        if allow_late_responses and query is not None and not query.is_response(r):
+            # Discard datagrams that answer a different query, typically a
+            # late response left in the socket by a previous timed-out query
+            # on a reused connection, instead of accepting an id collision or
+            # tearing down the whole socket.
             continue
         return (r, received_time, from_address)
 
@@ -195,6 +207,7 @@ async def udp(
     sock: dns.asyncbackend.DatagramSocket | None = None,
     backend: dns.asyncbackend.Backend | None = None,
     ignore_errors: bool = False,
+    allow_late_responses: bool = True,
 ) -> dns.message.Message:
     """Return the response obtained after sending a query via UDP.
 
@@ -207,7 +220,8 @@ async def udp(
     :type backend: :py:class:`dns.asyncbackend.Backend` or ``None``
 
     See :py:func:`dns.query.udp()` for the documentation of the other
-    parameters, exceptions, and return type of this method.
+    parameters, exceptions, and return type of this method, including
+    *allow_late_responses*.
     """
     wire = q.to_wire()
     begin_time, expiration = _compute_times(timeout)
@@ -238,11 +252,14 @@ async def udp(
             raise_on_truncation,
             ignore_errors,
             q,
+            allow_late_responses,
         )
         r.time = received_time - begin_time
         # We don't need to check q.is_response() if we are in ignore_errors mode
-        # as receive_udp() will have checked it.
-        if not (ignore_errors or q.is_response(r)):
+        # as receive_udp() will have checked it; and when late responses are
+        # allowed, receive_udp() will have discarded any non-matching
+        # datagram, so anything returned must answer this query.
+        if not (ignore_errors or allow_late_responses or q.is_response(r)):
             raise BadResponse
         return r
 
@@ -261,6 +278,7 @@ async def udp_with_fallback(
     tcp_sock: dns.asyncbackend.StreamSocket | None = None,
     backend: dns.asyncbackend.Backend | None = None,
     ignore_errors: bool = False,
+    allow_late_responses: bool = True,
 ) -> tuple[dns.message.Message, bool]:
     """Return the response to the query, trying UDP first and falling back
     to TCP if UDP results in a truncated response.
@@ -297,6 +315,7 @@ async def udp_with_fallback(
             udp_sock,
             backend,
             ignore_errors,
+            allow_late_responses,
         )
         return (response, False)
     except dns.message.Truncated:

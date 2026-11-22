@@ -18,6 +18,7 @@
 import asyncio
 import random
 import socket
+import threading
 import time
 import unittest
 
@@ -843,7 +844,73 @@ class IgnoreErrors(unittest.TestCase):
             s = MockSock(
                 bad_r_wire, ("127.0.0.1", 53), self.good_r_wire, ("127.0.0.1", 53)
             )
-            await dns.asyncquery.udp(self.good_r, "127.0.0.1", sock=s)
+            await dns.asyncquery.udp(
+                self.good_r,
+                "127.0.0.1",
+                sock=s,
+                allow_late_responses=False,
+            )
+
+        def bad():
+            self.async_run(abad)
+
+        self.assertRaises(dns.query.BadResponse, bad)
+
+    def test_late_response_is_discarded_udp_level(self):
+        # The async twin of the sync test: a stale datagram from an earlier
+        # query is discarded and the valid one is accepted on the same sock.
+        async def run():
+            bad_r = dns.message.make_response(self.q)
+            bad_r.id = (bad_r.id + 1) % 65536
+            bad_r_wire = bad_r.to_wire()
+            s = MockSock(
+                bad_r_wire,
+                ("127.0.0.1", 53),
+                self.good_r_wire,
+                ("127.0.0.1", 53),
+            )
+            r = await dns.asyncquery.udp(self.good_r, "127.0.0.1", sock=s)
+            self.assertEqual(r, self.good_r)
+
+        self.async_run(run)
+
+    def test_late_response_with_colliding_id_is_discarded(self):
+        # Async twin of the sync test: an id-colliding late response that
+        # answers a different question is dropped on the reused socket.
+        async def run():
+            previous_q = dns.message.make_query("previous-example.", "A")
+            late_r = dns.message.make_response(previous_q)
+            late_r.id = self.good_r.id
+            late_r_wire = late_r.to_wire()
+            s = MockSock(
+                late_r_wire,
+                ("127.0.0.1", 53),
+                self.good_r_wire,
+                ("127.0.0.1", 53),
+            )
+            r = await dns.asyncquery.udp(self.good_r, "127.0.0.1", sock=s)
+            self.assertEqual(r, self.good_r)
+
+        self.async_run(run)
+
+    def test_late_response_with_colliding_id_raises_when_disallowed(self):
+        async def abad():
+            previous_q = dns.message.make_query("previous-example.", "A")
+            late_r = dns.message.make_response(previous_q)
+            late_r.id = self.good_r.id
+            late_r_wire = late_r.to_wire()
+            s = MockSock(
+                late_r_wire,
+                ("127.0.0.1", 53),
+                self.good_r_wire,
+                ("127.0.0.1", 53),
+            )
+            await dns.asyncquery.udp(
+                self.good_r,
+                "127.0.0.1",
+                sock=s,
+                allow_late_responses=False,
+            )
 
         def bad():
             self.async_run(abad)
@@ -1013,3 +1080,80 @@ class IgnoreErrors(unittest.TestCase):
             self.async_run(abad)
 
         self.assertRaises(dns.message.TrailingJunk, bad)
+
+
+class ReusedSocketLateResponseTests(unittest.TestCase):
+    # Async twin of the same-named class in test_query.py.  A query times
+    # out, the datagram socket is reused for another query, and the late
+    # response to the first one only arrives afterwards; it must be
+    # recognized and discarded without discarding the socket.
+
+    def setUp(self):
+        self.backend = dns.asyncbackend.set_default_backend("asyncio")
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.server.bind(("127.0.0.1", 0))
+        self.server.settimeout(5)
+        self.addr = self.server.getsockname()
+
+    def tearDown(self):
+        self.server.close()
+
+    def async_run(self, afunc):
+        return asyncio.run(afunc())
+
+    def _server_thread(self, first_q, second_q, second_answer, colliding_id):
+        errors = []
+
+        def run():
+            try:
+                wire, peer = self.server.recvfrom(65535)
+                first_request = dns.message.from_wire(wire)
+                wire, _ = self.server.recvfrom(65535)
+                second_request = dns.message.from_wire(wire)
+                assert second_request.question == second_q.question
+                late_answer = dns.message.make_response(first_request)
+                if colliding_id:
+                    late_answer.id = second_q.id
+                self.server.sendto(late_answer.to_wire(), peer)
+                self.server.sendto(second_answer.to_wire(), peer)
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        return worker, errors
+
+    async def _run(self, colliding_id):
+        first_q = dns.message.make_query("first.example.", "A")
+        second_q = dns.message.make_query("second.example.", "A")
+        second_answer = dns.message.make_response(second_q)
+        worker, errors = self._server_thread(
+            first_q, second_q, second_answer, colliding_id
+        )
+
+        sock = await self.backend.make_socket(socket.AF_INET, socket.SOCK_DGRAM)
+        async with sock:
+            with self.assertRaises(dns.exception.Timeout):
+                await dns.asyncquery.udp(
+                    first_q,
+                    self.addr[0],
+                    port=self.addr[1],
+                    sock=sock,
+                    timeout=0.1,
+                )
+            response = await dns.asyncquery.udp(
+                second_q,
+                self.addr[0],
+                port=self.addr[1],
+                sock=sock,
+                timeout=5,
+            )
+        worker.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(response, second_answer)
+
+    def test_late_response_after_timeout_is_ignored(self):
+        self.async_run(lambda: self._run(False))
+
+    def test_late_response_with_colliding_id_after_timeout(self):
+        self.async_run(lambda: self._run(True))
